@@ -13,7 +13,7 @@ WITHDISPLAY = "display" in sys.argv or "CROCODDYL_DISPLAY" in os.environ
 WITHPLOT = "plot" in sys.argv or "CROCODDYL_PLOT" in os.environ
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-print("🚶 Hi Robot 简单步行程序")
+print("🚶 Hi Robot 简单步行程序 (修复版)")
 print("=" * 50)
 
 # 设置正确的路径
@@ -118,6 +118,13 @@ if abs(rfPos0[2]) > 0.05 or abs(lfPos0[2]) > 0.05:
 else:
     print(f"✅ 脚部位置合理，接近地面")
 
+# 🔧 修复：确保目标脚部位置也在地面附近
+# 如果脚部不在地面，调整目标位置
+if abs(rfPos0[2]) > 0.02:
+    print(f"🔧 调整目标脚部高度到地面")
+    rfPos0[2] = 0.0  # 强制设置到地面
+    lfPos0[2] = 0.0
+
 # 设置步行参数
 DT = 0.05  # 时间步长
 stepLength = 0.08  # 很小的步长
@@ -133,7 +140,6 @@ print(f"   📊 总步数: {T}")
 # 计算目标足部位置 - 右足向前一步
 rfTarget = rfPos0.copy()
 rfTarget[0] += stepLength  # X方向前进
-# 🔧 修复：确保目标位置也在地面
 rfTarget[2] = 0.0  # 确保目标位置在地面
 
 print(f"🎯 右足目标位置: ({rfTarget[0]:.3f}, {rfTarget[1]:.3f}, {rfTarget[2]:.3f})")
@@ -142,12 +148,12 @@ print(f"🎯 右足目标位置: ({rfTarget[0]:.3f}, {rfTarget[1]:.3f}, {rfTarge
 contactModel2Feet = crocoddyl.ContactModelMultiple(state, actuation.nu)
 contactModel1FootLeft = crocoddyl.ContactModelMultiple(state, actuation.nu)
 
-# 双足支撑接触
+# 双足支撑接触 - 🔧 修复：使用更严格的约束
 supportContactModelLeft = crocoddyl.ContactModel6D(
-    state, leftFootId, pinocchio.SE3.Identity(), pinocchio.LOCAL, actuation.nu, np.array([0, 25])
+    state, leftFootId, pinocchio.SE3.Identity(), pinocchio.LOCAL, actuation.nu, np.array([0, 30])
 )
 supportContactModelRight = crocoddyl.ContactModel6D(
-    state, rightFootId, pinocchio.SE3.Identity(), pinocchio.LOCAL, actuation.nu, np.array([0, 25])
+    state, rightFootId, pinocchio.SE3.Identity(), pinocchio.LOCAL, actuation.nu, np.array([0, 30])
 )
 
 contactModel2Feet.addContact("left_foot", supportContactModelLeft)
@@ -160,9 +166,9 @@ contactModel1FootLeft.addContact("left_foot", supportContactModelLeft)
 def createRunningCostModel():
     runningCostModel = crocoddyl.CostModelSum(state, actuation.nu)
     
-    # 状态正则化
+    # 状态正则化 - 🔧 修复：降低基座位置的权重，增加关节的权重
     xResidual = crocoddyl.ResidualModelState(state, x0, actuation.nu)
-    weights = np.array([0] * 3 + [10.0] * 3 + [0.01] * (state.nv - 6) + [1] * state.nv) ** 2
+    weights = np.array([0.1] * 3 + [5.0] * 3 + [0.1] * (state.nv - 6) + [1] * state.nv) ** 2
     xActivation = crocoddyl.ActivationModelWeightedQuad(weights)
     xRegCost = crocoddyl.CostModelResidual(state, xActivation, xResidual)
     
@@ -174,19 +180,31 @@ def createRunningCostModel():
     comResidual = crocoddyl.ResidualModelCoMPosition(state, comRef, actuation.nu)
     comTrackCost = crocoddyl.CostModelResidual(state, comResidual)
     
+    # 🔧 添加：姿态稳定性成本
+    orientationRef = pinocchio.utils.rpyToMatrix(0, 0, 0)  # 保持直立
+    orientationResidual = crocoddyl.ResidualModelFrameRotation(
+        state, rmodel.getFrameId("base_link"), orientationRef, actuation.nu
+    )
+    orientationCost = crocoddyl.CostModelResidual(state, orientationResidual)
+    
     # 添加成本
     runningCostModel.addCost("stateReg", xRegCost, 1e-2)
     runningCostModel.addCost("ctrlReg", uRegCost, 1e-4)
-    runningCostModel.addCost("comStable", comTrackCost, 1e1)
+    runningCostModel.addCost("comStable", comTrackCost, 5e0)  # 增加重心稳定权重
+    runningCostModel.addCost("orientation", orientationCost, 1e1)
     
     return runningCostModel
 
 def createSwingCostModel(target_pos, foot_id):
     swingCostModel = createRunningCostModel()
     
-    # 足部位置跟踪
+    # 足部位置跟踪 - 🔧 修复：确保目标位置在地面附近
+    target_pos_corrected = target_pos.copy()
+    if abs(target_pos_corrected[2]) > 0.02:
+        target_pos_corrected[2] = 0.0  # 确保在地面
+    
     footTrackingResidual = crocoddyl.ResidualModelFramePlacement(
-        state, foot_id, pinocchio.SE3(np.eye(3), target_pos), actuation.nu
+        state, foot_id, pinocchio.SE3(np.eye(3), target_pos_corrected), actuation.nu
     )
     footTrackingCost = crocoddyl.CostModelResidual(state, footTrackingResidual)
     swingCostModel.addCost("footTracking", footTrackingCost, 1e2)
@@ -212,7 +230,7 @@ for i in range(T//2):
     # 计算中间目标位置 (抛物线轨迹)
     intermediate_pos = rfPos0.copy()
     intermediate_pos[0] = rfPos0[0] + stepLength * progress  # X方向插值
-    intermediate_pos[2] = rfPos0[2] + stepHeight * np.sin(np.pi * progress)  # Z方向抛物线
+    intermediate_pos[2] = max(0.0, stepHeight * np.sin(np.pi * progress))  # Z方向抛物线，但不低于地面
     
     swingCostModel = createSwingCostModel(intermediate_pos, rightFootId)
     dmodel = crocoddyl.DifferentialActionModelContactFwdDynamics(
@@ -266,12 +284,16 @@ if solver.isFeasible:
     pinocchio.forwardKinematics(rmodel, rdata, xT[:state.nq])
     pinocchio.updateFramePlacements(rmodel, rdata)
     finalRfPos = np.array(rdata.oMf[rightFootId].translation.T.flat)
+    finalLfPos = np.array(rdata.oMf[leftFootId].translation.T.flat)
     
     print(f"\n📊 步行结果分析:")
     print(f"   🎯 目标位置: ({rfTarget[0]:.3f}, {rfTarget[1]:.3f}, {rfTarget[2]:.3f})")
     print(f"   🦶 右足最终位置: ({finalRfPos[0]:.3f}, {finalRfPos[1]:.3f}, {finalRfPos[2]:.3f})")
+    print(f"   🦶 左足最终位置: ({finalLfPos[0]:.3f}, {finalLfPos[1]:.3f}, {finalLfPos[2]:.3f})")
     print(f"   📏 步行距离: {np.linalg.norm(finalRfPos - rfPos0):.3f}m")
     print(f"   📐 X方向误差: {abs(finalRfPos[0] - rfTarget[0]):.3f}m")
+    print(f"   📐 右足离地高度: {abs(finalRfPos[2]):.3f}m")
+    print(f"   📐 左足离地高度: {abs(finalLfPos[2]):.3f}m")
     
 else:
     print("❌ 单步运动求解失败!")
